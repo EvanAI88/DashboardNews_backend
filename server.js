@@ -24,11 +24,10 @@ app.use(express.json());
 
 // ── EMAIL CONFIG ────────────────────────────────────────────────────────
 const emailTransporter = nodemailer.createTransport({
-  host: 'smtp.mailtrap.io',
-  port: 2525,
+  service: 'gmail',
   auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASSWORD,
+    user: process.env.EMAIL_USER || 'your-email@gmail.com',
+    pass: process.env.EMAIL_PASSWORD || 'your-app-password',
   },
 });
 
