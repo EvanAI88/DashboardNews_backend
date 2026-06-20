@@ -23,8 +23,10 @@ app.use(express.json());
 
 const NEWS_SOURCES = {
   finance: [
-    { name: 'Reuters', url: 'https://feeds.reuters.com/reuters/businessNews' },
+    { name: 'MarketWatch', url: 'https://feeds.bloomberg.com/markets/news.rss' },
     { name: 'CNBC', url: 'https://feeds.cnbc.com/cnbc/latest/' },
+    { name: 'Yahoo Finance', url: 'https://feeds.finance.yahoo.com/rss/2.0/headline' },
+    { name: 'BusinessInsider', url: 'https://feeds.bloomberg.com/markets/news.rss' },
   ],
   crypto: [
     { name: 'CoinDesk', url: 'https://www.coindesk.com/feed/' },
@@ -32,6 +34,7 @@ const NEWS_SOURCES = {
   ],
   ai: [
     { name: 'AI News', url: 'https://feeds.bloomberg.com/markets/news.rss' },
+    { name: 'MIT Tech Review', url: 'https://www.technologyreview.com/feed.rss' },
   ],
   tech: [
     { name: 'TechCrunch', url: 'https://techcrunch.com/feed/' },
@@ -98,6 +101,10 @@ async function fetchAllNews() {
 
 async function translateText(text, targetLang = 'id') {
   try {
+    const systemPrompt = targetLang === 'id' 
+      ? `Terjemahkan teks berikut ke dalam Bahasa Indonesia dengan gaya jurnalis profesional. Gunakan struktur bahasa yang rapi, detail, dan mudah dipahami. Pertahankan konteks dan makna asli. Hindari terjemahan literal. Gunakan terminologi bisnis/ekonomi Indonesia yang tepat. Output hanya terjemahan, tanpa penjelasan tambahan.`
+      : text;
+    
     const res = await axios.post('https://libretranslate.de/translate', {
       q: text,
       source: 'en',
@@ -105,8 +112,17 @@ async function translateText(text, targetLang = 'id') {
     }, {
       timeout: 5000,
     });
-    return res.data.translatedText || text;
+    
+    let translatedText = res.data.translatedText || text;
+    
+    // Clean up translation
+    translatedText = translatedText
+      .replace(/\s+/g, ' ')
+      .trim();
+    
+    return translatedText || text;
   } catch (error) {
+    console.warn('Translation error:', error.message);
     return text;
   }
 }
