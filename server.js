@@ -108,16 +108,24 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     const hashedPassword = await hashPassword(password);
+    
+    // CHECK IF ADMIN EMAIL
+    const isAdmin = email === 'admin@newspulse.com';
+    const adminRole = isAdmin ? 'admin' : 'user';
+    const adminStatus = isAdmin ? 'admin' : 'free_trial';
 
     const result = await query(
-      `INSERT INTO users (email, password, name, subscription_status, trial_start_date)
-       VALUES ($1, $2, $3, 'free_trial', CURRENT_TIMESTAMP)
-       RETURNING id, email, name, subscription_status, trial_start_date`,
-      [email, hashedPassword, name]
+      `INSERT INTO users (email, password, name, subscription_status, trial_start_date, role)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5)
+       RETURNING id, email, name, subscription_status, trial_start_date, role`,
+      [email, hashedPassword, name, adminStatus, adminRole]
     );
 
     const user = result.rows[0];
     const token = generateToken(user.id, user.email);
+    
+    let trialDaysRemaining = isAdmin ? 999 : 5;
+    let subscriptionStatus = isAdmin ? 'admin' : 'free_trial';
 
     res.status(201).json({
       ok: true,
@@ -126,8 +134,9 @@ app.post('/api/auth/register', async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
-        subscription_status: user.subscription_status,
-        trial_days_remaining: 5,
+        subscription_status: subscriptionStatus,
+        trial_days_remaining: trialDaysRemaining,
+        is_admin: isAdmin,
       },
       token: token,
     });
@@ -157,15 +166,23 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Invalid email or password' });
     }
 
-    const isExpired = isTrialExpired(user.trial_start_date);
-    let subscriptionStatus = user.subscription_status;
-
-    if (isExpired && subscriptionStatus === 'free_trial') {
-      subscriptionStatus = 'expired';
-    }
-
     const token = generateToken(user.id, user.email);
-    const trialDaysRemaining = getTrialDaysRemaining(user.trial_start_date);
+    
+    // CHECK ADMIN
+    let subscriptionStatus = user.subscription_status;
+    let trialDaysRemaining = 0;
+    let isAdmin = user.role === 'admin' || email === 'admin@newspulse.com';
+
+    if (isAdmin) {
+      subscriptionStatus = 'admin';
+      trialDaysRemaining = 999; // Unlimited
+    } else {
+      const isExpired = isTrialExpired(user.trial_start_date);
+      if (isExpired && subscriptionStatus === 'free_trial') {
+        subscriptionStatus = 'expired';
+      }
+      trialDaysRemaining = getTrialDaysRemaining(user.trial_start_date);
+    }
 
     res.json({
       ok: true,
@@ -176,6 +193,7 @@ app.post('/api/auth/login', async (req, res) => {
         name: user.name,
         subscription_status: subscriptionStatus,
         trial_days_remaining: trialDaysRemaining,
+        is_admin: isAdmin,
       },
       token: token,
     });
@@ -187,15 +205,26 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
-    const result = await query('SELECT id, email, name, subscription_status, trial_start_date FROM users WHERE id = $1', [req.user.id]);
+    const result = await query('SELECT id, email, name, subscription_status, trial_start_date, role FROM users WHERE id = $1', [req.user.id]);
     
     if (result.rows.length === 0) {
       return res.status(404).json({ ok: false, error: 'User not found' });
     }
 
     const user = result.rows[0];
-    const isExpired = isTrialExpired(user.trial_start_date);
-    const trialDaysRemaining = getTrialDaysRemaining(user.trial_start_date);
+    
+    // CHECK ADMIN
+    let subscriptionStatus = user.subscription_status;
+    let trialDaysRemaining = 0;
+    let isAdmin = user.role === 'admin' || user.email === 'admin@newspulse.com';
+
+    if (isAdmin) {
+      subscriptionStatus = 'admin';
+      trialDaysRemaining = 999; // Unlimited
+    } else {
+      const isExpired = isTrialExpired(user.trial_start_date);
+      trialDaysRemaining = getTrialDaysRemaining(user.trial_start_date);
+    }
 
     res.json({
       ok: true,
@@ -203,9 +232,10 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
-        subscription_status: user.subscription_status,
+        subscription_status: subscriptionStatus,
         trial_days_remaining: trialDaysRemaining,
-        trial_expired: isExpired,
+        trial_expired: false,
+        is_admin: isAdmin,
       },
     });
   } catch (error) {
