@@ -1,266 +1,154 @@
 const express = require('express');
-const cors = require('cors');
+const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const axios = require('axios');
-const xml2js = require('xml2js');
-require('dotenv').config();
-
-const { query, pool, initializeDatabase } = require('./database');
-const {
-  hashPassword,
-  comparePassword,
-  generateToken,
-  verifyToken,
-  authMiddleware,
-  isTrialExpired,
-  getTrialDaysRemaining,
-} = require('./auth');
+const Parser = require('rss-parser');
+const midtransClient = require('midtrans-client');
+const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
-
-app.use(cors());
 app.use(express.json());
 
-const NEWS_SOURCES = {
+// ===== DATABASE =====
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+// ===== MIDTRANS SETUP =====
+let snap = new midtransClient.Snap({
+  isProduction: false,
+  serverKey: process.env.MIDTRANS_SERVER_KEY,
+  clientKey: process.env.MIDTRANS_CLIENT_KEY,
+});
+
+// ===== CONFIG =====
+const JWT_SECRET = process.env.JWT_SECRET || 'newspulse-secret-2024';
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+let newsCache = null;
+let lastFetchTime = 0;
+
+// ===== RSS SOURCES =====
+const RSS_SOURCES = {
   finance: [
-    { name: 'MarketWatch', url: 'https://feeds.bloomberg.com/markets/news.rss' },
-    { name: 'CNBC', url: 'https://feeds.cnbc.com/cnbc/latest/' },
-    { name: 'Yahoo Finance', url: 'https://feeds.finance.yahoo.com/rss/2.0/headline' },
-    { name: 'BusinessInsider', url: 'https://feeds.bloomberg.com/markets/news.rss' },
+    'https://feeds.bloomberg.com/markets/news.rss',
+    'https://feeds.businessinsider.com/finance',
   ],
   crypto: [
-    { name: 'CoinDesk', url: 'https://www.coindesk.com/feed/' },
-    { name: 'Cointelegraph', url: 'https://cointelegraph.com/feed' },
+    'https://feeds.coindesk.com/latest',
+    'https://feeds.cointelegraph.com/rss',
   ],
   ai: [
-    { name: 'AI News', url: 'https://feeds.bloomberg.com/markets/news.rss' },
-    { name: 'MIT Tech Review', url: 'https://www.technologyreview.com/feed.rss' },
+    'https://feeds.bloomberg.com/technology/news.rss',
   ],
   tech: [
-    { name: 'TechCrunch', url: 'https://techcrunch.com/feed/' },
-    { name: 'The Verge', url: 'https://www.theverge.com/rss/index.xml' },
+    'https://feeds.techcrunch.com/',
+    'https://www.theverge.com/rss/index.xml',
   ],
 };
 
-const cache = {
-  news: [],
-  lastUpdate: 0,
-  CACHE_TTL: 5 * 60 * 1000,
-};
+// ===== MIDDLEWARE =====
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
 
-async function parseRSSFeed(xmlString, source, category) {
-  try {
-    const parser = new xml2js.Parser({ explicitArray: false });
-    const result = await parser.parseStringPromise(xmlString);
-    let items = result?.rss?.channel?.item || [];
-    if (!Array.isArray(items)) items = [items];
-    
-    return items
-      .filter(item => item.title && item.title.trim())
-      .slice(0, 5)
-      .map(item => ({
-        source: source.name,
-        category: category,
-        title: item.title?.trim() || 'No title',
-        description: (item.description || '')
-          .replace(/<[^>]*>/g, '')
-          .substring(0, 300),
-        link: item.link?.trim() || '#',
-        pubDate: item.pubDate || new Date().toISOString(),
-      }));
-  } catch (error) {
-    console.error(`Error parsing ${source.name}:`, error.message);
-    return [];
+  if (!token) {
+    return res.status(401).json({ ok: false, error: 'No token provided' });
   }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(401).json({ ok: false, error: 'Invalid token' });
+    req.user = user;
+    next();
+  });
 }
 
-async function fetchAllNews() {
-  console.log('📰 Fetching news...');
-  let allNews = [];
-  
-  for (const [category, sources] of Object.entries(NEWS_SOURCES)) {
-    for (const source of sources) {
-      try {
-        const response = await axios.get(source.url, {
-          timeout: 8000,
-          headers: { 'User-Agent': 'Mozilla/5.0 NewsPulseBot/1.0' }
-        });
-        const news = await parseRSSFeed(response.data, source, category);
-        allNews = allNews.concat(news);
-        console.log(`✅ ${source.name} fetched (${news.length} items)`);
-      } catch (error) {
-        console.warn(`⚠️  ${source.name} failed`);
-      }
-    }
-  }
-  
-  allNews.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
-  console.log(`📊 Total news fetched: ${allNews.length}`);
-  return allNews;
-}
+// ===== AUTH ENDPOINTS =====
 
-async function translateText(text, targetLang = 'id') {
-  try {
-    const systemPrompt = targetLang === 'id' 
-      ? `Terjemahkan teks berikut ke dalam Bahasa Indonesia dengan gaya jurnalis profesional. Gunakan struktur bahasa yang rapi, detail, dan mudah dipahami. Pertahankan konteks dan makna asli. Hindari terjemahan literal. Gunakan terminologi bisnis/ekonomi Indonesia yang tepat. Output hanya terjemahan, tanpa penjelasan tambahan.`
-      : text;
-    
-    const res = await axios.post('https://libretranslate.de/translate', {
-      q: text,
-      source: 'en',
-      target: targetLang,
-    }, {
-      timeout: 5000,
-    });
-    
-    let translatedText = res.data.translatedText || text;
-    
-    // Clean up translation
-    translatedText = translatedText
-      .replace(/\s+/g, ' ')
-      .trim();
-    
-    return translatedText || text;
-  } catch (error) {
-    console.warn('Translation error:', error.message);
-    return text;
-  }
-}
-
-// REGISTER (DIRECT)
+// POST /api/auth/register
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, name } = req.body;
 
     if (!email || !password || !name) {
-      return res.status(400).json({ ok: false, error: 'Semua field harus diisi' });
+      return res.status(400).json({ ok: false, error: 'Missing fields' });
     }
 
-    const existingUser = await query('SELECT id FROM users WHERE email = $1', [email]);
-    if (existingUser.rows.length > 0) {
-      return res.status(400).json({ ok: false, error: 'Email sudah terdaftar' });
+    const userCheck = await db.query('SELECT id FROM users WHERE email = $1', [email]);
+    if (userCheck.rows.length > 0) {
+      return res.status(400).json({ ok: false, error: 'Email already exists' });
     }
 
-    const hashedPassword = await hashPassword(password);
+    const hashedPassword = await bcrypt.hash(password, 10);
     const isAdmin = email === 'admin@newspulse.com';
-    const adminRole = isAdmin ? 'admin' : 'user';
-    const adminStatus = isAdmin ? 'admin' : 'free_trial';
 
-    const result = await query(
-      `INSERT INTO users (email, password, name, subscription_status, trial_start_date, role)
-       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, $5)
-       RETURNING id, email, name, subscription_status, trial_start_date, role`,
-      [email, hashedPassword, name, adminStatus, adminRole]
+    const result = await db.query(
+      `INSERT INTO users (email, password, name, is_admin, trial_days_remaining, subscription_status, subscription_expiry)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '5 days')
+       RETURNING id, email, name, is_admin, trial_days_remaining`,
+      [email, hashedPassword, name, isAdmin, isAdmin ? 0 : 5]
     );
 
     const user = result.rows[0];
-    const token = generateToken(user.id, user.email);
+    const token = jwt.sign(user, JWT_SECRET, { expiresIn: '30d' });
 
-    res.status(201).json({
+    res.json({
       ok: true,
-      message: 'Registrasi berhasil!',
+      token,
       user: {
         id: user.id,
         email: user.email,
         name: user.name,
-        subscription_status: adminStatus,
-        trial_days_remaining: isAdmin ? 999 : 5,
-        is_admin: isAdmin,
+        is_admin: user.is_admin,
+        trial_days_remaining: user.trial_days_remaining,
       },
-      token: token,
     });
   } catch (error) {
-    console.error('Register error:', error);
-    res.status(500).json({ ok: false, error: 'Server error' });
+    res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-// LOGIN (DIRECT)
+// POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ ok: false, error: 'Email dan password harus diisi' });
+      return res.status(400).json({ ok: false, error: 'Missing fields' });
     }
 
-    const result = await query('SELECT * FROM users WHERE email = $1', [email]);
+    const result = await db.query(
+      `SELECT id, email, password, name, is_admin, trial_days_remaining 
+       FROM users WHERE email = $1`,
+      [email]
+    );
+
     if (result.rows.length === 0) {
-      return res.status(401).json({ ok: false, error: 'Email atau password salah' });
+      return res.status(401).json({ ok: false, error: 'Invalid credentials' });
     }
 
     const user = result.rows[0];
-    const passwordMatch = await comparePassword(password, user.password);
-    if (!passwordMatch) {
-      return res.status(401).json({ ok: false, error: 'Email atau password salah' });
+    const validPassword = await bcrypt.compare(password, user.password);
+
+    if (!validPassword) {
+      return res.status(401).json({ ok: false, error: 'Invalid credentials' });
     }
 
-    const token = generateToken(user.id, user.email);
-    const isAdmin = user.role === 'admin' || email === 'admin@newspulse.com';
-    let subscriptionStatus = user.subscription_status;
-    let trialDaysRemaining = 0;
-
-    if (isAdmin) {
-      subscriptionStatus = 'admin';
-      trialDaysRemaining = 999;
-    } else {
-      const isExpired = isTrialExpired(user.trial_start_date);
-      if (isExpired && subscriptionStatus === 'free_trial') {
-        subscriptionStatus = 'expired';
-      }
-      trialDaysRemaining = getTrialDaysRemaining(user.trial_start_date);
-    }
+    const token = jwt.sign(
+      { id: user.id, email: user.email, name: user.name, is_admin: user.is_admin },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
 
     res.json({
       ok: true,
-      message: 'Login berhasil!',
+      token,
       user: {
         id: user.id,
         email: user.email,
         name: user.name,
-        subscription_status: subscriptionStatus,
-        trial_days_remaining: trialDaysRemaining,
-        is_admin: isAdmin,
-      },
-      token: token,
-    });
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ ok: false, error: 'Server error' });
-  }
-});
-
-// GET CURRENT USER
-app.get('/api/auth/me', authMiddleware, async (req, res) => {
-  try {
-    const result = await query('SELECT id, email, name, subscription_status, trial_start_date, role FROM users WHERE id = $1', [req.user.id]);
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ ok: false, error: 'User tidak ditemukan' });
-    }
-
-    const user = result.rows[0];
-    const isAdmin = user.role === 'admin' || user.email === 'admin@newspulse.com';
-    let subscriptionStatus = user.subscription_status;
-    let trialDaysRemaining = 0;
-
-    if (isAdmin) {
-      subscriptionStatus = 'admin';
-      trialDaysRemaining = 999;
-    } else {
-      const isExpired = isTrialExpired(user.trial_start_date);
-      trialDaysRemaining = getTrialDaysRemaining(user.trial_start_date);
-    }
-
-    res.json({
-      ok: true,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        subscription_status: subscriptionStatus,
-        trial_days_remaining: trialDaysRemaining,
-        is_admin: isAdmin,
+        is_admin: user.is_admin,
+        trial_days_remaining: user.trial_days_remaining,
       },
     });
   } catch (error) {
@@ -268,61 +156,124 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   }
 });
 
-// GET NEWS (WITH TRANSLATION)
-app.get('/api/news', authMiddleware, async (req, res) => {
+// GET /api/auth/me
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
-    const now = Date.now();
-    let news = [];
-    
-    if (cache.news.length > 0 && now - cache.lastUpdate < cache.CACHE_TTL) {
-      news = cache.news;
-    } else {
-      news = await fetchAllNews();
-      cache.news = news;
-      cache.lastUpdate = now;
+    const result = await db.query(
+      `SELECT id, email, name, is_admin, trial_days_remaining, subscription_status, subscription_expiry 
+       FROM users WHERE id = $1`,
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'User not found' });
     }
 
-    // TRANSLATE JIKA DIMINTA
-    const shouldTranslate = req.query.translate === 'id';
-    if (shouldTranslate && news.length > 0) {
-      console.log('🌐 Translating to Indonesian...');
-      for (let i = 0; i < news.length; i++) {
-        news[i].title_id = await translateText(news[i].title, 'id');
-        news[i].description_id = await translateText(news[i].description, 'id');
-      }
-    }
-
+    const user = result.rows[0];
     res.json({
       ok: true,
-      count: news.length,
-      news: news,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        is_admin: user.is_admin,
+        trial_days_remaining: user.trial_days_remaining,
+        subscription_status: user.subscription_status,
+        subscription_expiry: user.subscription_expiry,
+      },
     });
   } catch (error) {
-    console.error('News error:', error);
     res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-// ADMIN STATS
-app.get('/api/admin/stats', authMiddleware, async (req, res) => {
+// ===== NEWS ENDPOINTS =====
+
+async function fetchNews() {
+  const now = Date.now();
+
+  if (newsCache && now - lastFetchTime < CACHE_TTL) {
+    console.log('📦 Using cached news');
+    return newsCache;
+  }
+
+  console.log('🔄 Fetching fresh news...');
+  const parser = new Parser();
+  let allNews = [];
+
+  for (const [category, sources] of Object.entries(RSS_SOURCES)) {
+    for (const source of sources) {
+      try {
+        const feed = await parser.parseURL(source);
+        feed.items.slice(0, 3).forEach(item => {
+          allNews.push({
+            category,
+            title: item.title || 'No title',
+            description: item.content || item.summary || 'No description',
+            link: item.link || '#',
+            source: feed.title || 'Unknown',
+            pubDate: item.pubDate || new Date().toISOString(),
+          });
+        });
+      } catch (error) {
+        console.warn(`Error fetching ${source}:`, error.message);
+      }
+    }
+  }
+
+  // Deduplicate
+  const seen = new Set();
+  allNews = allNews.filter(item => {
+    if (seen.has(item.title)) return false;
+    seen.add(item.title);
+    return true;
+  });
+
+  newsCache = allNews;
+  lastFetchTime = now;
+  return allNews;
+}
+
+// GET /api/news
+app.get('/api/news', authenticateToken, async (req, res) => {
   try {
-    const user = await query('SELECT role FROM users WHERE id = $1', [req.user.id]);
-    if (!user.rows.length || user.rows[0].role !== 'admin') {
-      return res.status(403).json({ ok: false, error: 'Admin only' });
+    const news = await fetchNews();
+    res.json({ ok: true, news });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+// ===== ADMIN ENDPOINTS =====
+
+// GET /api/admin/stats
+app.get('/api/admin/stats', authenticateToken, async (req, res) => {
+  try {
+    const user = await db.query('SELECT id FROM users WHERE id = $1 AND (is_admin = true OR email = $2)', [
+      req.user.id,
+      'admin@newspulse.com',
+    ]);
+
+    if (user.rows.length === 0) {
+      return res.status(403).json({ ok: false, error: 'Not authorized' });
     }
 
-    const totalUsers = await query('SELECT COUNT(*) FROM users');
-    const premiumUsers = await query('SELECT COUNT(*) FROM users WHERE subscription_status = $1', ['premium']);
-    const trialUsers = await query('SELECT COUNT(*) FROM users WHERE subscription_status = $1', ['free_trial']);
-    const revenue = await query('SELECT SUM(CAST(price AS NUMERIC)) as total FROM subscriptions WHERE payment_status = $1', ['completed']);
+    const totalUsersResult = await db.query('SELECT COUNT(*) as count FROM users');
+    const premiumResult = await db.query(
+      "SELECT COUNT(*) as count FROM users WHERE subscription_status = 'active'"
+    );
+    const trialResult = await db.query("SELECT COUNT(*) as count FROM users WHERE subscription_status = 'trial'");
+    const revenueResult = await db.query('SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE status = $1', [
+      'success',
+    ]);
 
     res.json({
       ok: true,
       stats: {
-        totalUsers: parseInt(totalUsers.rows[0].count),
-        premiumUsers: parseInt(premiumUsers.rows[0].count),
-        trialUsers: parseInt(trialUsers.rows[0].count),
-        revenue: parseFloat(revenue.rows[0].total) || 0,
+        totalUsers: parseInt(totalUsersResult.rows[0].count),
+        premiumUsers: parseInt(premiumResult.rows[0].count),
+        trialUsers: parseInt(trialResult.rows[0].count),
+        revenue: parseFloat(revenueResult.rows[0].total) / 100000 || 0,
       },
     });
   } catch (error) {
@@ -330,62 +281,199 @@ app.get('/api/admin/stats', authMiddleware, async (req, res) => {
   }
 });
 
-// ADMIN USERS
-app.get('/api/admin/users', authMiddleware, async (req, res) => {
+// GET /api/admin/users
+app.get('/api/admin/users', authenticateToken, async (req, res) => {
   try {
-    const user = await query('SELECT role FROM users WHERE id = $1', [req.user.id]);
-    if (!user.rows.length || user.rows[0].role !== 'admin') {
-      return res.status(403).json({ ok: false, error: 'Admin only' });
+    const user = await db.query('SELECT id FROM users WHERE id = $1 AND (is_admin = true OR email = $2)', [
+      req.user.id,
+      'admin@newspulse.com',
+    ]);
+
+    if (user.rows.length === 0) {
+      return res.status(403).json({ ok: false, error: 'Not authorized' });
     }
 
-    const users = await query('SELECT id, email, name, subscription_status, created_at FROM users ORDER BY created_at DESC LIMIT 50');
+    const result = await db.query(
+      `SELECT id, email, name, is_admin, subscription_status, created_at 
+       FROM users ORDER BY created_at DESC`
+    );
+
     res.json({
       ok: true,
-      users: users.rows,
+      users: result.rows.map(u => ({
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        is_admin: u.is_admin,
+        status: u.subscription_status,
+        created_at: u.created_at,
+      })),
     });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
 });
 
-// HEALTH
-app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    status: 'Server running',
-    version: '3.0.0 (Simplified)',
-  });
-});
+// ===== PAYMENT ENDPOINTS =====
 
-async function startServer() {
+// POST /api/payment/subscribe
+app.post('/api/payment/subscribe', authenticateToken, async (req, res) => {
   try {
-    await pool.query('SELECT NOW()');
-    console.log('✅ Connected to PostgreSQL');
+    const { plan } = req.body;
+    const user = req.user;
 
-    await initializeDatabase();
+    const plans = {
+      monthly: { price: 49000, duration: 30, name: 'Premium 1 Month' },
+      yearly: { price: 399000, duration: 365, name: 'Premium 1 Year' },
+    };
 
-    app.listen(PORT, async () => {
-      console.log('\n');
-      console.log('╔════════════════════════════════════════════════════════╗');
-      console.log('║    🚀 NEWSPULSE PHASE 3 FINAL SERVER STARTED          ║');
-      console.log('║       (Simplified - No OTP, Focus on News & Translate  ║');
-      console.log('╚════════════════════════════════════════════════════════╝');
-      console.log('');
-      console.log(`📍 Server: https://dashboardnews-backend.onrender.com`);
-      console.log('');
-      console.log('📌 Auth: POST /api/auth/register, POST /api/auth/login');
-      console.log('📌 News: GET /api/news (?translate=id for Indonesian)');
-      console.log('📌 Admin: GET /api/admin/stats, GET /api/admin/users');
-      console.log('');
+    if (!plans[plan]) {
+      return res.status(400).json({ ok: false, error: 'Invalid plan' });
+    }
 
-      await fetchAllNews();
-      
-      setInterval(fetchAllNews, 10 * 60 * 1000);
+    const planData = plans[plan];
+    const orderId = `ORDER-${user.id}-${Date.now()}`;
+
+    const transactionDetails = {
+      transaction_details: {
+        order_id: orderId,
+        gross_amount: planData.price,
+      },
+      customer_details: {
+        email: user.email,
+        first_name: user.name,
+        phone: '08123456789',
+      },
+      item_details: [
+        {
+          id: plan,
+          price: planData.price,
+          quantity: 1,
+          name: planData.name,
+        },
+      ],
+    };
+
+    const token = await snap.createTransaction(transactionDetails);
+
+    await db.query(
+      `INSERT INTO transactions (user_id, order_id, plan, amount, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())`,
+      [user.id, orderId, plan, planData.price, 'pending']
+    );
+
+    res.json({
+      ok: true,
+      snapToken: token.token,
+      snapUrl: token.redirect_url,
     });
   } catch (error) {
-    console.error('❌ Startup error:', error);
-    process.exit(1);
+    console.error('Payment error:', error);
+    res.status(500).json({ ok: false, error: error.message });
   }
-}
+});
 
-startServer();
+// POST /api/payment/callback
+app.post('/api/payment/callback', async (req, res) => {
+  try {
+    const notification = req.body;
+
+    const signature = crypto
+      .createHash('sha512')
+      .update(
+        notification.order_id +
+          notification.status_code +
+          notification.gross_amount +
+          process.env.MIDTRANS_SERVER_KEY
+      )
+      .digest('hex');
+
+    if (signature !== notification.signature_key) {
+      return res.status(401).json({ ok: false, error: 'Invalid signature' });
+    }
+
+    const transactionStatus = notification.transaction_status;
+    const orderId = notification.order_id;
+
+    let newStatus = 'pending';
+    let subscriptionDays = 0;
+
+    if (transactionStatus === 'capture' || transactionStatus === 'settlement') {
+      newStatus = 'success';
+      const txResult = await db.query('SELECT plan FROM transactions WHERE order_id = $1', [orderId]);
+      if (txResult.rows.length > 0) {
+        subscriptionDays = txResult.rows[0].plan === 'yearly' ? 365 : 30;
+      }
+    } else if (transactionStatus === 'cancel' || transactionStatus === 'deny') {
+      newStatus = 'failed';
+    }
+
+    await db.query(
+      `UPDATE transactions SET status = $1, updated_at = NOW(), paid_at = NOW()
+       WHERE order_id = $2`,
+      [newStatus, orderId]
+    );
+
+    if (newStatus === 'success') {
+      const userResult = await db.query(
+        `SELECT user_id FROM transactions WHERE order_id = $1`,
+        [orderId]
+      );
+
+      if (userResult.rows.length > 0) {
+        const userId = userResult.rows[0].user_id;
+        const expiryDate = new Date();
+        expiryDate.setDate(expiryDate.getDate() + subscriptionDays);
+
+        await db.query(
+          `UPDATE users SET subscription_status = 'active', subscription_expiry = $1, trial_days_remaining = 0
+           WHERE id = $2`,
+          [expiryDate, userId]
+        );
+
+        console.log(`✅ Payment success for user ${userId}`);
+      }
+    }
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Callback error:', error);
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+// GET /api/payment/status/:orderId
+app.get('/api/payment/status/:orderId', authenticateToken, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+
+    const result = await db.query(
+      `SELECT * FROM transactions WHERE order_id = $1 AND user_id = $2`,
+      [orderId, req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Transaction not found' });
+    }
+
+    res.json({
+      ok: true,
+      transaction: result.rows[0],
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+// ===== HEALTH CHECK =====
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, status: 'Server running', news_cached: newsCache ? 'yes' : 'no' });
+});
+
+// ===== START SERVER =====
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`✅ NewsPulse backend running on port ${PORT}`);
+  console.log(`📰 News sources: ${Object.keys(RSS_SOURCES).length} categories`);
+  console.log(`💳 Payment: Midtrans ${process.env.MIDTRANS_SERVER_KEY ? 'enabled' : 'disabled'}`);
+});
