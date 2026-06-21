@@ -91,13 +91,12 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const isAdmin = email === 'admin@newspulse.com';
 
     const result = await db.query(
-      `INSERT INTO users (email, password, name, is_admin, trial_days_remaining, subscription_status, subscription_expiry)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '5 days')
-       RETURNING id, email, name, is_admin, trial_days_remaining`,
-      [email, hashedPassword, name, isAdmin, isAdmin ? 0 : 5]
+      `INSERT INTO users (email, password, name)
+       VALUES ($1, $2, $3)
+       RETURNING id, email, name`,
+      [email, hashedPassword, name]
     );
 
     const user = result.rows[0];
@@ -129,8 +128,7 @@ app.post('/api/auth/login', async (req, res) => {
     }
 
     const result = await db.query(
-      `SELECT id, email, password, name, is_admin, trial_days_remaining 
-       FROM users WHERE email = $1`,
+      `SELECT id, email, password, name FROM users WHERE email = $1`,
       [email]
     );
 
@@ -145,8 +143,10 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Invalid credentials' });
     }
 
+    const isAdmin = user.email === 'admin@newspulse.com';
+
     const token = jwt.sign(
-      { id: user.id, email: user.email, name: user.name, is_admin: user.is_admin },
+      { id: user.id, email: user.email, name: user.name, isAdmin },
       JWT_SECRET,
       { expiresIn: '30d' }
     );
@@ -158,8 +158,7 @@ app.post('/api/auth/login', async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
-        is_admin: user.is_admin,
-        trial_days_remaining: user.trial_days_remaining,
+        isAdmin,
       },
     });
   } catch (error) {
