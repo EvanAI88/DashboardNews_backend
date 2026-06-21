@@ -48,6 +48,8 @@ const RSS_SOURCES = {
   crypto: [
     'https://feeds.coindesk.com/latest',
     'https://feeds.cointelegraph.com/rss',
+    'https://bitcoinmagazine.com/feed',
+    'https://www.crypto-news-flash.com/feed/',
   ],
   ai: [
     'https://feeds.bloomberg.com/technology/news.rss',
