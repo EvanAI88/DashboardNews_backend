@@ -50,6 +50,14 @@ const RSS_SOURCES = {
     'https://feeds.cointelegraph.com/rss',
     'https://bitcoinmagazine.com/feed',
     'https://www.crypto-news-flash.com/feed/',
+    'https://www.theblock.co/post/rss.xml',
+    'https://cryptoslate.com/feed/',
+    'https://bitcoinmagazine.com/.rss/full/',
+    'https://cryptopotato.com/feed/](https://cryptopotato.com/feed/',
+    'ttps://coingape.com/feed/](https://coingape.com/feed/',
+    'https://protos.com/feed/',
+    'https://blog.ethereum.org/feed.xml',
+    
   ],
   ai: [
     'https://feeds.bloomberg.com/technology/news.rss',
