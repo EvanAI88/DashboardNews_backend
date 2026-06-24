@@ -53,11 +53,10 @@ const RSS_SOURCES = {
     'https://www.theblock.co/post/rss.xml',
     'https://cryptoslate.com/feed/',
     'https://bitcoinmagazine.com/.rss/full/',
-    'https://cryptopotato.com/feed/](https://cryptopotato.com/feed/',
-    'ttps://coingape.com/feed/](https://coingape.com/feed/',
+    'https://cryptopotato.com/feed/',
+    'https://coingape.com/feed/',
     'https://protos.com/feed/',
     'https://blog.ethereum.org/feed.xml',
-    
   ],
   ai: [
     'https://feeds.bloomberg.com/technology/news.rss',
@@ -180,7 +179,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT id, email, name, is_admin, trial_days_remaining, subscription_status, subscription_expiry 
+      `SELECT id, email, name, created_at, subscription_status, subscription_expiry 
        FROM users WHERE id = $1`,
       [req.user.id]
     );
@@ -190,14 +189,25 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     }
 
     const user = result.rows[0];
+    const isAdmin = user.email === 'admin@newspulse.com';
+    
+    // Calculate trial days remaining
+    let trialDaysRemaining = 0;
+    if (!isAdmin && user.subscription_status === 'trial') {
+      const createdDate = new Date(user.created_at);
+      const now = new Date();
+      const daysElapsed = Math.floor((now - createdDate) / (1000 * 60 * 60 * 24));
+      trialDaysRemaining = Math.max(0, 5 - daysElapsed); // 5 days total trial
+    }
+
     res.json({
       ok: true,
       user: {
         id: user.id,
         email: user.email,
         name: user.name,
-        is_admin: user.is_admin,
-        trial_days_remaining: user.trial_days_remaining,
+        isAdmin: isAdmin,
+        trial_days_remaining: trialDaysRemaining,
         subscription_status: user.subscription_status,
         subscription_expiry: user.subscription_expiry,
       },
