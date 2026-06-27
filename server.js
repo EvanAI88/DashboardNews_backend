@@ -44,6 +44,8 @@ const RSS_SOURCES = {
   finance: [
     'https://feeds.bloomberg.com/markets/news.rss',
     'https://feeds.businessinsider.com/finance',
+    'https://www.marketwatch.com/rss/topstories',
+    'https://finance.yahoo.com/news/rssindex',
   ],
   crypto: [
     'https://feeds.coindesk.com/latest',
@@ -60,10 +62,13 @@ const RSS_SOURCES = {
   ],
   ai: [
     'https://feeds.bloomberg.com/technology/news.rss',
+    'https://techcrunch.com/category/artificial-intelligence/feed/',
+    'https://www.wired.com/feed/tag/ai/latest/rss',
   ],
   tech: [
     'https://feeds.techcrunch.com/',
     'https://www.theverge.com/rss/index.xml',
+    'https://www.wired.com/feed/rss',
   ],
 };
 
@@ -101,15 +106,22 @@ app.post('/api/auth/register', async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    // FIX 1: Set subscription_status = 'trial' dan created_at saat register
     const result = await db.query(
-      `INSERT INTO users (email, password, name)
-       VALUES ($1, $2, $3)
+      `INSERT INTO users (email, password, name, subscription_status, created_at)
+       VALUES ($1, $2, $3, 'trial', NOW())
        RETURNING id, email, name`,
       [email, hashedPassword, name]
     );
 
     const user = result.rows[0];
-    const token = jwt.sign(user, JWT_SECRET, { expiresIn: '30d' });
+    const isAdmin = user.email === 'admin@newspulse.com';
+
+    const token = jwt.sign(
+      { id: user.id, email: user.email, name: user.name, isAdmin },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
 
     res.json({
       ok: true,
@@ -118,8 +130,8 @@ app.post('/api/auth/register', async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
-        is_admin: user.is_admin,
-        trial_days_remaining: user.trial_days_remaining,
+        isAdmin,
+        trial_days_remaining: 5,
       },
     });
   } catch (error) {
@@ -190,14 +202,45 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 
     const user = result.rows[0];
     const isAdmin = user.email === 'admin@newspulse.com';
-    
+
+    // FIX 2: Patch existing users yang subscription_status masih NULL
+    if (!isAdmin && !user.subscription_status) {
+      await db.query(
+        `UPDATE users SET subscription_status = 'trial' WHERE id = $1`,
+        [user.id]
+      );
+      user.subscription_status = 'trial';
+    }
+
+    // FIX 3: Kalau created_at NULL, set ke sekarang
+    if (!user.created_at) {
+      await db.query(
+        `UPDATE users SET created_at = NOW() WHERE id = $1`,
+        [user.id]
+      );
+      user.created_at = new Date();
+    }
+
     // Calculate trial days remaining
     let trialDaysRemaining = 0;
-    if (!isAdmin && user.subscription_status === 'trial') {
+    let subscriptionLabel = 'expired';
+
+    if (isAdmin) {
+      subscriptionLabel = 'admin';
+    } else if (user.subscription_status === 'active' && user.subscription_expiry) {
+      const expiry = new Date(user.subscription_expiry);
+      if (expiry > new Date()) {
+        subscriptionLabel = 'active';
+        trialDaysRemaining = 0;
+      } else {
+        subscriptionLabel = 'expired';
+      }
+    } else if (user.subscription_status === 'trial') {
       const createdDate = new Date(user.created_at);
       const now = new Date();
       const daysElapsed = Math.floor((now - createdDate) / (1000 * 60 * 60 * 24));
-      trialDaysRemaining = Math.max(0, 5 - daysElapsed); // 5 days total trial
+      trialDaysRemaining = Math.max(0, 5 - daysElapsed);
+      subscriptionLabel = trialDaysRemaining > 0 ? 'trial' : 'expired';
     }
 
     res.json({
@@ -206,9 +249,9 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
         id: user.id,
         email: user.email,
         name: user.name,
-        isAdmin: isAdmin,
+        isAdmin,
         trial_days_remaining: trialDaysRemaining,
-        subscription_status: user.subscription_status,
+        subscription_status: subscriptionLabel,
         subscription_expiry: user.subscription_expiry,
       },
     });
@@ -239,26 +282,32 @@ async function fetchNews() {
           allNews.push({
             category,
             title: item.title || 'No title',
-            description: item.content || item.summary || 'No description',
+            description: item.content || item.summary || item.contentSnippet || 'No description',
             link: item.link || '#',
             source: feed.title || 'Unknown',
             pubDate: item.pubDate || new Date().toISOString(),
           });
         });
+        console.log(`✅ ${category} - ${feed.title}: ${feed.items.length} items`);
       } catch (error) {
-        console.warn(`Error fetching ${source}:`, error.message);
+        console.warn(`⚠️  ${source} failed:`, error.message);
       }
     }
   }
 
-  // Deduplicate
+  // Deduplicate by title
   const seen = new Set();
   allNews = allNews.filter(item => {
-    if (seen.has(item.title)) return false;
-    seen.add(item.title);
+    const key = item.title.toLowerCase().trim();
+    if (seen.has(key)) return false;
+    seen.add(key);
     return true;
   });
 
+  // Sort by date (newest first)
+  allNews.sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate));
+
+  console.log(`📊 Total news fetched: ${allNews.length}`);
   newsCache = allNews;
   lastFetchTime = now;
   return allNews;
@@ -279,12 +328,7 @@ app.get('/api/news', authenticateToken, async (req, res) => {
 // GET /api/admin/stats
 app.get('/api/admin/stats', authenticateToken, async (req, res) => {
   try {
-    const user = await db.query('SELECT id FROM users WHERE id = $1 AND (is_admin = true OR email = $2)', [
-      req.user.id,
-      'admin@newspulse.com',
-    ]);
-
-    if (user.rows.length === 0) {
+    if (req.user.email !== 'admin@newspulse.com') {
       return res.status(403).json({ ok: false, error: 'Not authorized' });
     }
 
@@ -292,10 +336,12 @@ app.get('/api/admin/stats', authenticateToken, async (req, res) => {
     const premiumResult = await db.query(
       "SELECT COUNT(*) as count FROM users WHERE subscription_status = 'active'"
     );
-    const trialResult = await db.query("SELECT COUNT(*) as count FROM users WHERE subscription_status = 'trial'");
-    const revenueResult = await db.query('SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE status = $1', [
-      'success',
-    ]);
+    const trialResult = await db.query(
+      "SELECT COUNT(*) as count FROM users WHERE subscription_status = 'trial'"
+    );
+    const revenueResult = await db.query(
+      "SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE status = 'success'"
+    );
 
     res.json({
       ok: true,
@@ -303,7 +349,7 @@ app.get('/api/admin/stats', authenticateToken, async (req, res) => {
         totalUsers: parseInt(totalUsersResult.rows[0].count),
         premiumUsers: parseInt(premiumResult.rows[0].count),
         trialUsers: parseInt(trialResult.rows[0].count),
-        revenue: parseFloat(revenueResult.rows[0].total) / 100000 || 0,
+        revenue: parseFloat(revenueResult.rows[0].total) / 100 || 0,
       },
     });
   } catch (error) {
@@ -314,17 +360,12 @@ app.get('/api/admin/stats', authenticateToken, async (req, res) => {
 // GET /api/admin/users
 app.get('/api/admin/users', authenticateToken, async (req, res) => {
   try {
-    const user = await db.query('SELECT id FROM users WHERE id = $1 AND (is_admin = true OR email = $2)', [
-      req.user.id,
-      'admin@newspulse.com',
-    ]);
-
-    if (user.rows.length === 0) {
+    if (req.user.email !== 'admin@newspulse.com') {
       return res.status(403).json({ ok: false, error: 'Not authorized' });
     }
 
     const result = await db.query(
-      `SELECT id, email, name, is_admin, subscription_status, created_at 
+      `SELECT id, email, name, subscription_status, created_at 
        FROM users ORDER BY created_at DESC`
     );
 
@@ -334,8 +375,7 @@ app.get('/api/admin/users', authenticateToken, async (req, res) => {
         id: u.id,
         email: u.email,
         name: u.name,
-        is_admin: u.is_admin,
-        status: u.subscription_status,
+        status: u.subscription_status || 'trial',
         created_at: u.created_at,
       })),
     });
@@ -353,8 +393,8 @@ app.post('/api/payment/subscribe', authenticateToken, async (req, res) => {
     const user = req.user;
 
     const plans = {
-      monthly: { price: 49000, duration: 30, name: 'Premium 1 Month' },
-      yearly: { price: 399000, duration: 365, name: 'Premium 1 Year' },
+      monthly: { price: 49000, duration: 30, name: 'Premium 1 Bulan' },
+      yearly: { price: 399000, duration: 365, name: 'Premium 1 Tahun' },
     };
 
     if (!plans[plan]) {
@@ -371,7 +411,7 @@ app.post('/api/payment/subscribe', authenticateToken, async (req, res) => {
       },
       customer_details: {
         email: user.email,
-        first_name: user.name,
+        first_name: user.name || 'User',
         phone: '08123456789',
       },
       item_details: [
@@ -388,14 +428,15 @@ app.post('/api/payment/subscribe', authenticateToken, async (req, res) => {
 
     await db.query(
       `INSERT INTO transactions (user_id, order_id, plan, amount, status, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [user.id, orderId, plan, planData.price, 'pending']
+       VALUES ($1, $2, $3, $4, 'pending', NOW())`,
+      [user.id, orderId, plan, planData.price]
     );
 
     res.json({
       ok: true,
       snapToken: token.token,
       snapUrl: token.redirect_url,
+      orderId,
     });
   } catch (error) {
     console.error('Payment error:', error);
@@ -403,7 +444,7 @@ app.post('/api/payment/subscribe', authenticateToken, async (req, res) => {
   }
 });
 
-// POST /api/payment/callback
+// POST /api/payment/callback (Midtrans webhook)
 app.post('/api/payment/callback', async (req, res) => {
   try {
     const notification = req.body;
@@ -430,21 +471,24 @@ app.post('/api/payment/callback', async (req, res) => {
 
     if (transactionStatus === 'capture' || transactionStatus === 'settlement') {
       newStatus = 'success';
-      const txResult = await db.query('SELECT plan FROM transactions WHERE order_id = $1', [orderId]);
+      const txResult = await db.query(
+        'SELECT plan FROM transactions WHERE order_id = $1',
+        [orderId]
+      );
       if (txResult.rows.length > 0) {
         subscriptionDays = txResult.rows[0].plan === 'yearly' ? 365 : 30;
       }
-    } else if (transactionStatus === 'cancel' || transactionStatus === 'deny') {
+    } else if (transactionStatus === 'cancel' || transactionStatus === 'deny' || transactionStatus === 'expire') {
       newStatus = 'failed';
     }
 
     await db.query(
-      `UPDATE transactions SET status = $1, updated_at = NOW(), paid_at = NOW()
+      `UPDATE transactions SET status = $1, updated_at = NOW()
        WHERE order_id = $2`,
       [newStatus, orderId]
     );
 
-    if (newStatus === 'success') {
+    if (newStatus === 'success' && subscriptionDays > 0) {
       const userResult = await db.query(
         `SELECT user_id FROM transactions WHERE order_id = $1`,
         [orderId]
@@ -456,12 +500,13 @@ app.post('/api/payment/callback', async (req, res) => {
         expiryDate.setDate(expiryDate.getDate() + subscriptionDays);
 
         await db.query(
-          `UPDATE users SET subscription_status = 'active', subscription_expiry = $1, trial_days_remaining = 0
+          `UPDATE users 
+           SET subscription_status = 'active', subscription_expiry = $1
            WHERE id = $2`,
           [expiryDate, userId]
         );
 
-        console.log(`✅ Payment success for user ${userId}`);
+        console.log(`✅ Payment success for user ${userId}, expires ${expiryDate}`);
       }
     }
 
@@ -486,10 +531,7 @@ app.get('/api/payment/status/:orderId', authenticateToken, async (req, res) => {
       return res.status(404).json({ ok: false, error: 'Transaction not found' });
     }
 
-    res.json({
-      ok: true,
-      transaction: result.rows[0],
-    });
+    res.json({ ok: true, transaction: result.rows[0] });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
   }
@@ -497,13 +539,42 @@ app.get('/api/payment/status/:orderId', authenticateToken, async (req, res) => {
 
 // ===== HEALTH CHECK =====
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, status: 'Server running', news_cached: newsCache ? 'yes' : 'no' });
+  res.json({
+    ok: true,
+    status: 'Server running',
+    news_cached: newsCache ? `${newsCache.length} items` : 'no',
+    time: new Date().toLocaleString('id-ID'),
+  });
 });
 
 // ===== START SERVER =====
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`✅ NewsPulse backend running on port ${PORT}`);
-  console.log(`📰 News sources: ${Object.keys(RSS_SOURCES).length} categories`);
-  console.log(`💳 Payment: Midtrans ${process.env.MIDTRANS_SERVER_KEY ? 'enabled' : 'disabled'}`);
-});
+
+async function startServer() {
+  try {
+    await db.query('SELECT NOW()');
+    console.log('✅ Database connected');
+
+    // Patch existing users: set subscription_status = 'trial' where NULL
+    await db.query(
+      `UPDATE users SET subscription_status = 'trial' 
+       WHERE subscription_status IS NULL AND email != 'admin@newspulse.com'`
+    );
+    console.log('✅ Patched existing users subscription_status');
+
+    app.listen(PORT, () => {
+      console.log(`✅ NewsPulse backend running on port ${PORT}`);
+      console.log(`📰 News sources: ${Object.keys(RSS_SOURCES).length} categories`);
+      console.log(`💳 Payment: Midtrans ${process.env.MIDTRANS_SERVER_KEY ? 'enabled' : 'disabled'}`);
+    });
+
+    // Fetch news on startup
+    fetchNews().catch(err => console.warn('Initial news fetch failed:', err.message));
+
+  } catch (err) {
+    console.error('❌ Failed to start:', err.message);
+    process.exit(1);
+  }
+}
+
+startServer();
